@@ -89,7 +89,7 @@ ret   -- int value - 1 (true) for same, 0 (false) for different, < 0 for error\n
 pcc   -- double value the peak of cross correlation\n\
 ");
 PyDoc_STRVAR( compare_audio__doc__,
-"compare_audio(file1, file2, sr=8000, channels=1, threshold=0.30, block_size=256) -> double[]\n\n\
+"compare_audio(file1, file2, sr=8000, channels=1, threshold=0.30, block_size=256) -> double\n\n\
 Compare 2 audio files audio hash distance\n\
 Keyword arguments: \n\
 sr       -- sample rate on which to base the audiohash\n\
