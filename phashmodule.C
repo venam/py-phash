@@ -6,6 +6,7 @@
 #include <Python.h>
 #include <structmember.h>
 #include <pHash.h>
+#include <audiophash.h>
 
 ///--- Documentation ---///
 /* The module doc string */
@@ -17,7 +18,6 @@ the avalanche effect of small changes in input leading to drastic changes in \n\
 the output, perceptual hashes are \"close\" to one another if the features are\n\
 similar.\n\
 ";
-
 
 /* The functions doc string */
 PyDoc_STRVAR( compare_images__doc__,
@@ -88,7 +88,26 @@ return   -- (ret,pcc)\n\
 ret   -- int value - 1 (true) for same, 0 (false) for different, < 0 for error\n\
 pcc   -- double value the peak of cross correlation\n\
 ");
-
+PyDoc_STRVAR( compare_audio__doc__,
+"compare_audio(file1, file2, sr=8000, channels=1, threshold=0.30, block_size=256) -> double[]\n\n\
+Compare 2 audio files audio hash distance\n\
+Keyword arguments: \n\
+sr       -- sample rate on which to base the audiohash\n\
+channels -- nb channels to convert to (always 1) unused\n\
+threshold-- threshold value to compare successive blocks, 0.25, 0.30, 0.35\n\
+block_size--length of block_size, 256\n\
+return   -- confidence score\n\
+");
+PyDoc_STRVAR( compare_texthash__doc__,
+"compare_texthash(file1, file2) -> pHash.TxtCompare \n\n\
+textual hash for file\n\
+Keyword arguments: \n\
+file1    -- name of the first file\n\
+file2    -- name of the second file\n\
+return   -- A struct containing the hash length of the first file,  the hash \n\
+length of the second file, the number of matches, and the maximum consecutive \n\
+similar hashes.\n\
+");
 ///--- Globals ---///
 static PyObject *pHashError;
 
@@ -99,22 +118,39 @@ typedef struct pHashDigest {
     int size;
 } pHashDigest;
 
+typedef struct pHashTextCompare {
+    PyObject_HEAD
+    int length1;
+    int length2;
+    int matches;
+    int maxlength;
+} pHashTextCompare;
+
 static PyTypeObject pHashDigestType = {
     PyObject_HEAD_INIT(NULL)
 };
 
+static PyTypeObject pHashTextCompareType = {
+    PyObject_HEAD_INIT(NULL)
+};
+
 static PyMemberDef pHashDigest_members[] = {
-    {"id", T_STRING, offsetof(pHashDigest, id), 0, "id"},
-    {"coeffs", T_OBJECT, offsetof(pHashDigest, coeffs), 0, "coeffs"},
-    {"size", T_INT, offsetof(pHashDigest, size), 0, "size"},
+    {(char*)"id", T_STRING, offsetof(pHashDigest, id), 0, (char*)"id"},
+    {(char*)"coeffs", T_OBJECT, offsetof(pHashDigest, coeffs), 0, (char*)"coeffs"},
+    {(char*)"size", T_INT, offsetof(pHashDigest, size), 0, (char*)"size"},
+    {NULL}
+};
+static PyMemberDef pHashTextCompare_members[] = {
+    {(char*)"length1", T_INT, offsetof(pHashTextCompare, length1), 0, (char*)"length1"},
+    {(char*)"length2", T_INT, offsetof(pHashTextCompare, length2), 0, (char*)"length2"},
+    {(char*)"matches", T_INT, offsetof(pHashTextCompare, matches), 0, (char*)"matches"},
+    {(char*)"maxlength", T_INT, offsetof(pHashTextCompare, maxlength), 0, (char*)"maxlength"},
     {NULL}
 };
 
 ///--- Foo Prototypes ---///
 static PyObject * PyList_FromUint8Array(uint8_t *array, int len);
-static PyObject * PyList_FromUint32Array(uint32_t *array, int len);
-static PyObject * PyList_FromDoubleArray(double *array, int len);
-static uint8_t* arrayFromPyList(PyObject* pyList);
+static uint8_t  * arrayFromPyList(PyObject* pyList);
 static bool file_ready_for_reading (const char *filename);
 
 static PyObject * phash_compare_images(PyObject *self, PyObject *args, PyObject *keywds);
@@ -124,6 +160,8 @@ static PyObject * phash_image_digest(PyObject *self, PyObject *args, PyObject *k
 static PyObject * phash_hamming_distance(PyObject *self, PyObject *args);
 static PyObject * phash_hamming_distance2(PyObject *self, PyObject *args);
 static PyObject * phash_crosscorr(PyObject *self, PyObject *args, PyObject *keywds);
+static PyObject * phash_compare_texthash(PyObject *self, PyObject *args);
+static PyObject * phash_compare_audio(PyObject *self, PyObject *args, PyObject *keywds);
 
 
 ///--- Definition of the pHash pythons library methods ---///
@@ -142,6 +180,10 @@ static PyMethodDef pHash_methods[] = {
         hamming_distance2__doc__ },
     { "crosscorr", (PyCFunction)phash_crosscorr, METH_VARARGS|METH_KEYWORDS,
         crosscorr__doc__ },
+    { "compare_texthash", phash_compare_texthash, METH_VARARGS,
+        compare_texthash__doc__ },
+    { "compare_audio", (PyCFunction)phash_compare_audio, METH_VARARGS|METH_KEYWORDS,
+        compare_audio__doc__ },
     { NULL, NULL, 0, NULL}
 };
 
@@ -205,27 +247,40 @@ initpHash(void)
     PyObject *m = Py_InitModule3("pHash", pHash_methods, module_docstring);
     if (m ==NULL) return;
     /* Error handler */
-    pHashError = PyErr_NewException("pHash.error", NULL, NULL);
+    pHashError = PyErr_NewException((char*)"pHash.error", NULL, NULL);
     Py_INCREF(pHashError);
     PyModule_AddObject(m, "error", pHashError);
     /* Digest type */
-    pHashDigestType.tp_name   = "pHash.Digest";
-    pHashDigestType.tp_basicsize = sizeof(pHashDigest);
-    pHashDigestType.tp_new     = PyType_GenericNew;
-    pHashDigestType.tp_methods   = NULL;
-    pHashDigestType.tp_members   = pHashDigest_members;
-    pHashDigestType.tp_flags     = Py_TPFLAGS_DEFAULT;
-    pHashDigestType.tp_doc     = "A pHash radial digest object";
+    pHashDigestType.tp_name           = "pHash.Digest";
+    pHashDigestType.tp_basicsize      = sizeof(pHashDigest);
+    pHashDigestType.tp_new            = PyType_GenericNew;
+    pHashDigestType.tp_methods        = NULL;
+    pHashDigestType.tp_members        = pHashDigest_members;
+    pHashDigestType.tp_flags          = Py_TPFLAGS_DEFAULT;
+    pHashDigestType.tp_doc            = "A pHash radial digest object";
     PyType_Ready(&pHashDigestType);
     Py_INCREF(&pHashDigestType);
     PyModule_AddObject(m, "Digest", (PyObject *)&pHashDigestType);
+    /* TextCompare type */
+    pHashTextCompareType.tp_name      = "pHash.TextCompare";
+    pHashTextCompareType.tp_basicsize = sizeof(pHashTextCompare);
+    pHashTextCompareType.tp_new       = PyType_GenericNew;
+    pHashTextCompareType.tp_methods   = NULL;
+    pHashTextCompareType.tp_members   = pHashTextCompare_members;
+    pHashTextCompareType.tp_flags     = Py_TPFLAGS_DEFAULT;
+    pHashTextCompareType.tp_doc       = "A structure containing the result of textual hash";
+    PyType_Ready(&pHashTextCompareType);
+    Py_INCREF(&pHashTextCompareType);
+    PyModule_AddObject(m, "TextCompare", (PyObject *)&pHashTextCompareType);
 }
 
 static PyObject *
 phash_compare_images(PyObject *self, PyObject *args, PyObject *keywds)
 {
     /* set keywords and default args */
-    static char *kwlist[] = {"file1", "file2", "pcc", "sigma", "gamma", "N", "threshold", NULL};
+    static char *kwlist[] = {
+        (char*)"file1", (char*)"file2", (char*)"pcc", (char*)"sigma",
+        (char*)"gamma", (char*)"N", (char*)"threshold", (char*)NULL};
     const char *file1;
     const char *file2;
     double pcc     = 0.0;
@@ -270,7 +325,8 @@ static PyObject *
 phash_mh_imagehash(PyObject *self, PyObject *args, PyObject *keywds)
 {
     /* set keywords and default args */
-    static char *kwlist[] = {"filename", "alpha", "lvl", NULL};
+    static char *kwlist[] = {
+        (char*)"filename", (char*)"alpha", (char*)"lvl", (char*)NULL};
     const char *filename;
     int N        = 0;
     float alpha   = 2.0f;
@@ -291,7 +347,8 @@ static PyObject *
 phash_image_digest(PyObject *self, PyObject *args, PyObject *keywds)
 {
     /* set keywords and default args */
-    static char *kwlist[] = {"file", "sigma", "gamma", "N", NULL};
+    static char *kwlist[] = {
+        (char*)"file", (char*)"sigma", (char*)"gamma", (char*)"N", (char*)NULL};
     const char *filename;
     double sigma=1.0, gamma=1.0;
     Digest dig;
@@ -364,7 +421,8 @@ static PyObject *
 phash_crosscorr(PyObject *self, PyObject *args, PyObject *keywds)
 {
     /* set keywords and default args */
-    static char *kwlist[] = {"x", "y", "threshold", NULL};
+    static char *kwlist[] = {
+        (char*)"x", (char*)"y", (char*)"threshold", (char*)NULL};
     int ret, size, i;
     double pcc, threshold = 0.90;
     PyObject *py_Digest1, *py_Digest2;
@@ -416,4 +474,144 @@ phash_crosscorr(PyObject *self, PyObject *args, PyObject *keywds)
     free(coeffs1);
     free(coeffs2);
     return Py_BuildValue("(i,d)", ret, pcc);
+}
+
+static PyObject *
+phash_compare_texthash(PyObject *self, PyObject *args)
+{
+
+    const char *file1;
+    const char *file2;
+    TxtHashPoint *hash1, *hash2;
+    int nbhashes1 = 0,nbhashes2 = 0, maxlength = 0,count,j=0;
+    pHashTextCompare *txtcmp;
+
+    if(!PyArg_ParseTuple(args, "ss", &file1, &file2))
+        return NULL;
+    /* Check if the file exist and ready for reading */
+    if (!file_ready_for_reading(file1) || !file_ready_for_reading(file2))
+        return NULL;
+
+    hash1 = ph_texthash(file1,&nbhashes1);
+    if (!hash1){
+        PyErr_SetString(pHashError,
+            "Unable to complete text hash function for file1.");
+        return NULL;
+    }
+
+    hash2 = ph_texthash(file2,&nbhashes2);
+    if (!hash2){
+        PyErr_SetString(pHashError,
+            "Unable to complete text hash function for file2.");
+        return NULL;
+    }
+
+    TxtMatch *matches = ph_compare_text_hashes(hash1, nbhashes1, hash2, nbhashes2, &count);
+    free(hash1);
+    free(hash2);
+    if (!matches){
+        PyErr_SetString(pHashError,
+            "Unable to complete compare function.");
+        return NULL;
+    }
+
+    /* This is the weirdest thing ever!
+     * matches[j].length returns garbage values
+     * but the same thing works flawlessly in a separate Cpp file
+     * So the texthash works but this value is total garbage.
+     */
+    for (j=0;j<count;j++){
+        if (matches[j].length > maxlength){
+            maxlength = matches[j].length;
+        }
+    }
+    free(matches);
+
+    txtcmp = (pHashTextCompare *)PyObject_New(pHashTextCompare, &pHashTextCompareType);
+    txtcmp->length1    = nbhashes1;
+    txtcmp->length2    = nbhashes2;
+    txtcmp->matches    = count;
+    txtcmp->maxlength  = maxlength;
+
+    return Py_BuildValue("O", txtcmp);
+}
+
+static PyObject *
+phash_compare_audio(PyObject *self, PyObject *args, PyObject *keywds)
+{
+    /* This function crash too much
+     * even when running in the example.
+     */
+    // set keywords and default args
+    static char *kwlist[] =
+        {(char*)"file1", (char*)"file2", (char*)"sr", (char*)"channels",
+        (char*)"threshold", (char*)"block_size", (char*)NULL};
+
+    const char *file1, *file2;
+    int sr          = 8000; //sample rate to convert the stream
+    int channels    = 1;    //number of channels to convert stream
+    float threshold = 0.30; //ber threshold (0.25-0.35)
+    int block_size  = 256;  //number of frames to compare at a time
+    // take the args from the user
+    if(!PyArg_ParseTupleAndKeywords(args, keywds , "ss|iifi", kwlist,
+        &file1, &file2, &sr, &channels, &threshold, &block_size))
+        return NULL;
+    // Check if the file exist and ready for reading
+    if (!file_ready_for_reading(file1) || !file_ready_for_reading(file1))
+        return NULL;
+
+    float *buf;
+    int buflen;
+    uint32_t *hash1, *hash2;
+    int hashlen1, hashlen2;
+    double *cs;
+    int Nc;
+    int index, i, j;
+
+    buf = ph_readaudio(file1, sr, channels, NULL, buflen);
+    if (!buf){
+        PyErr_SetString(pHashError,
+                "Unable to read audio of file1.");
+        return NULL;
+    }
+    hash1 = ph_audiohash(buf, buflen, sr, hashlen1);
+    if (!hash1){
+        PyErr_SetString(pHashError,
+            "Unable to get hash1.");
+        return NULL;
+    }
+    free(buf);
+
+    buf = ph_readaudio(file2, sr, channels, NULL, buflen);
+    if (!buf) {
+        PyErr_SetString(pHashError,
+            "Unable to read audio of file2.");
+        return NULL;
+    }
+    hash2 = ph_audiohash(buf, buflen, sr, hashlen2);
+    if (!hash2) {
+        PyErr_SetString(pHashError,
+            "Unable to get hash2.");
+        return NULL;
+    }
+
+    cs = ph_audio_distance_ber(hash1, hashlen1, hash2, hashlen2, threshold, block_size, Nc);
+    if (!cs){
+        PyErr_SetString(pHashError,
+            "Unable to calculate distance.");
+        return NULL;
+    }
+
+    double max_cs = 0.0;
+    for (i=0;i<Nc;i++){
+        if (cs[i] > max_cs){
+            max_cs = cs[i];
+        }
+    }
+
+    free(hash2);
+    free(hash1);
+    free(buf);
+    free(cs);
+    return Py_BuildValue("d",max_cs);
 }
